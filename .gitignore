@@ -1,0 +1,15 @@
+# Rust target
+/target
+**/*.rs.bk
+*.pdb
+*.exe
+
+# IDE & Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs & Temp
+*.log
+*.tmp
