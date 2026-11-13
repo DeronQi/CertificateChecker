@@ -1,0 +1,157 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate version tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Parse version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?)$ ]]; then
+            echo "Expected a version tag such as v0.1.0 or v0.1.0-rc.1" >&2
+            exit 1
+          fi
+          echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          notes_file="docs/releases/${RELEASE_TAG}.md"
+          if [[ ! -s "$notes_file" ]]; then
+            echo "Expected non-empty release notes at $notes_file" >&2
+            exit 1
+          fi
+
+  verify:
+    name: Verify release source
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  package-windows:
+    name: Package Windows x64 Binary & Archive
+    needs: [prepare, verify]
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Windows Release executable
+        run: cargo build --release --locked
+
+      - name: Verify PE GUI subsystem & CLI smoke test
+        run: |
+          $exePath = "target\release\win_cert_checker.exe"
+          if (-not (Test-Path $exePath)) {
+            throw "Release binary not found at $exePath"
+          }
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $exePath))
+          $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3C)
+          $subsystem = [System.BitConverter]::ToInt16($bytes, $peOffset + 0x5C)
+          if ($subsystem -ne 2) {
+            throw "Expected Windows GUI subsystem (2), got $subsystem"
+          }
+
+      - name: Package release assets
+        env:
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $version = $env:RELEASE_VERSION
+          $stageDir = "artifacts\stage\CertificateChecker-win-x64-$version"
+          $releaseDir = "artifacts\release"
+          New-Item -ItemType Directory -Force -Path $stageDir, $releaseDir | Out-Null
+
+          $portableExe = Join-Path $releaseDir "CertificateChecker-win-x64-$version.exe"
+          Copy-Item "target\release\win_cert_checker.exe" $portableExe -Force
+
+          Copy-Item "target\release\win_cert_checker.exe" (Join-Path $stageDir "win_cert_checker.exe") -Force
+          Copy-Item "README.md" (Join-Path $stageDir "README.md") -Force
+          Copy-Item "DESIGN.md" (Join-Path $stageDir "DESIGN.md") -Force
+          Copy-Item "LICENSE" (Join-Path $stageDir "LICENSE") -Force
+
+          $zipPath = Join-Path $releaseDir "CertificateChecker-win-x64-$version.zip"
+          Compress-Archive -Path "$stageDir\*" -DestinationPath $zipPath -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-win-x64
+          path: artifacts/release/CertificateChecker-win-x64-*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: [prepare, package-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Check assets and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          shopt -s nullglob
+          assets=(release-assets/*)
+          if (( ${#assets[@]} != 2 )); then
+            echo "Expected 2 release assets (.exe and .zip); found ${#assets[@]}" >&2
+            ls -la release-assets/ >&2
+            exit 1
+          fi
+          sha256sum "${assets[@]}" | sed 's#release-assets/##' > release-assets/SHA256SUMS
+          notes_file="docs/releases/${RELEASE_TAG}.md"
+          test -s "$notes_file"
+          release_flags=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            release_flags+=(--prerelease)
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --title "$RELEASE_TAG" --notes-file "$notes_file" "${release_flags[@]}"
+            gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release-assets/* --verify-tag --title "$RELEASE_TAG" --notes-file "$notes_file" "${release_flags[@]}"
+          fi
